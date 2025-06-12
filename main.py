@@ -1,4 +1,4 @@
-# main.py
+# main.py - AI Service Updates
 import os
 import requests
 from fastapi import FastAPI, HTTPException
@@ -33,6 +33,14 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
 
+class SmartReplyRequest(BaseModel):
+    recent_messages: List[Dict[str, str]] = Field(..., description="List of recent messages with 'author' and 'content' keys")
+    current_user: str = Field(..., description="Name of the current user")
+    max_suggestions: int = Field(default=3, ge=1, le=5)
+
+class SmartReplyResponse(BaseModel):
+    suggestions: List[str] = Field(..., description="List of suggested replies")
+
 # --- FastAPI Application ---
 app = FastAPI(
     title="Chat Application AI Service",
@@ -63,13 +71,12 @@ async def summarize(payload: SummarizeRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/api/v1/chat", response_model=ChatResponse, tags=["AI Features"])
 async def chat(payload: ChatRequest):
     """
     Generates a conversational reply using a single, formatted prompt string.
     """
-    # ***[FIX]*** Build a single prompt string with the correct chat template.
+    # Build a single prompt string with the correct chat template.
     prompt_parts = []
     # Interleave past user inputs and generated responses
     for user_input, assistant_response in zip(payload.past_user_inputs, payload.generated_responses):
@@ -107,6 +114,90 @@ async def chat(payload: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/v1/smart-replies", response_model=SmartReplyResponse, tags=["AI Features"])
+async def generate_smart_replies(payload: SmartReplyRequest):
+    """
+    Generate contextual reply suggestions based on recent conversation.
+    """
+    try:
+        # Build conversation context (last 5-10 messages)
+        recent_context = []
+        for msg in payload.recent_messages[-10:]:  # Last 10 messages for context
+            recent_context.append(f"{msg['author']}: {msg['content']}")
+        
+        conversation_context = "\n".join(recent_context)
+        
+        # Create prompt for generating reply suggestions
+        prompt = f"""<|user|>
+Based on this conversation, suggest 3 short, appropriate replies that {payload.current_user} could send. 
+Make them natural, contextual, and varied in tone (e.g., one professional, one casual, one question).
+Each reply should be on a new line and be concise (under 20 words).
+
+Conversation:
+{conversation_context}
+
+Generate 3 reply suggestions for {payload.current_user}:</s>
+<|assistant|>"""
+
+        response_data = query_huggingface(
+            {
+                "inputs": prompt,
+                "parameters": {
+                    "max_new_tokens": 100,
+                    "return_full_text": False,
+                    "temperature": 0.8,
+                    "top_p": 0.9,
+                    "do_sample": True
+                }
+            },
+            API_URL_CHAT
+        )
+        
+        if response_data and isinstance(response_data, list):
+            generated_text = response_data[0].get("generated_text", "").strip()
+            
+            # Parse the suggestions (split by newlines and clean up)
+            suggestions = []
+            for line in generated_text.split('\n'):
+                line = line.strip()
+                # Clean up common prefixes
+                for prefix in ['1.', '2.', '3.', '-', '*', '•']:
+                    if line.startswith(prefix):
+                        line = line[len(prefix):].strip()
+                
+                if line and len(line) > 3 and len(line) < 100:  # Reasonable length
+                    suggestions.append(line)
+                    
+                if len(suggestions) >= payload.max_suggestions:
+                    break
+            
+            # Fallback suggestions if AI didn't generate good ones
+            if not suggestions:
+                # Analyze last message for context-aware fallbacks
+                last_message = payload.recent_messages[-1] if payload.recent_messages else None
+                if last_message:
+                    last_content = last_message['content'].lower()
+                    if '?' in last_content:
+                        suggestions = ["Thanks for asking!", "Let me think about that", "Good question!"]
+                    elif 'thanks' in last_content or 'thank you' in last_content:
+                        suggestions = ["You're welcome!", "No problem!", "Happy to help!"]
+                    elif 'meeting' in last_content:
+                        suggestions = ["Sounds good!", "I'll be there", "What time works?"]
+                    else:
+                        suggestions = ["Got it!", "Makes sense", "Thanks for the update"]
+                else:
+                    suggestions = ["Hi there!", "Thanks!", "Sounds good!"]
+            
+            return {"suggestions": suggestions[:payload.max_suggestions]}
+            
+        else:
+            # Fallback suggestions
+            return {"suggestions": ["Thanks!", "Got it!", "Sounds good!"]}
+            
+    except Exception as e:
+        print(f"Smart reply error: {e}")
+        # Fallback suggestions on error
+        return {"suggestions": ["Thanks!", "Got it!", "Let me check on that"]}
 
 @app.get("/", tags=["Health Check"])
 async def read_root():
